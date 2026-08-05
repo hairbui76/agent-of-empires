@@ -46,6 +46,12 @@ impl<'a> CachedPreview<'a> {
 /// clipped on every frame and the user sees content shifted up.
 pub fn agent_info_height(instance: &Instance) -> u16 {
     let base: u16 = 3; // profile+tool / path / status
+    let session_lines: u16 = if shows_agent_session_row(instance) {
+        1
+    } else {
+        0
+    };
+    let base = base + session_lines;
     let sandbox_lines: u16 = if instance.is_sandboxed() { 1 } else { 0 };
     if let Some(wt) = instance.worktree_info.as_ref() {
         // blank + header + branch + main (+ optional base)
@@ -54,6 +60,19 @@ pub fn agent_info_height(instance: &Instance) -> u16 {
     } else {
         base + sandbox_lines
     }
+}
+
+/// Whether the agent info header carries a `Session:` row for `instance`.
+///
+/// Shared by [`agent_info_height`] and `Preview::render_info` so the reported
+/// row count and the rendered rows cannot drift — see the clipping failure
+/// described on [`agent_info_height`] for what drift costs.
+///
+/// False until the agent's conversation id has been captured (a fresh session
+/// has none until the agent reports one), so the row appears once there is
+/// something to show rather than rendering an empty label.
+pub(crate) fn shows_agent_session_row(instance: &Instance) -> bool {
+    instance.agent_session_id.is_some()
 }
 
 /// Row count of the Terminal-view (and Tool-view) info header
@@ -325,44 +344,57 @@ impl Preview {
         ));
         info_lines.push(Line::from(profile_tool_spans));
 
-        info_lines.extend([
-            Line::from(vec![
-                Span::styled("Path:    ", Style::default().fg(theme.dimmed)),
-                Span::styled(
-                    shorten_path(&instance.project_path),
-                    Style::default().fg(theme.text),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Status:  ", Style::default().fg(theme.dimmed)),
-                {
-                    // A dormant (idle-reaped, resumable) structured worker
-                    // reads "Dormant" in dim amber, distinct from a deliberate
-                    // Stop or a live Idle. See #2250.
-                    let (label, color) = if instance.is_shown_dormant() {
-                        ("Dormant".to_string(), theme.dormant())
-                    } else {
-                        (
-                            format!("{:?}", instance.status),
-                            match instance.status {
-                                crate::session::Status::Running => theme.running,
-                                crate::session::Status::Waiting => theme.waiting,
-                                crate::session::Status::Idle => {
-                                    theme.idle_color_at_age(instance.idle_age(), idle_decay_window)
-                                }
-                                crate::session::Status::Unknown => theme.waiting,
-                                crate::session::Status::Stopped => theme.dimmed,
-                                crate::session::Status::Error => theme.error,
-                                crate::session::Status::Starting => theme.dimmed,
-                                crate::session::Status::Deleting => theme.waiting,
-                                crate::session::Status::Creating => theme.accent,
-                            },
-                        )
-                    };
-                    Span::styled(label, Style::default().fg(color))
-                },
-            ]),
-        ]);
+        info_lines.push(Line::from(vec![
+            Span::styled("Path:    ", Style::default().fg(theme.dimmed)),
+            Span::styled(
+                shorten_path(&instance.project_path),
+                Style::default().fg(theme.text),
+            ),
+        ]));
+
+        // The agent's own conversation id, directly under Path. Shown in full
+        // rather than shortened: its whole point is being copyable into
+        // `claude --resume <id>` or `aoe session set-session-id`. Gated on the
+        // same predicate `agent_info_height` uses, or the header would render
+        // taller than the layout reserved for it.
+        if shows_agent_session_row(instance) {
+            if let Some(sid) = instance.agent_session_id.as_deref() {
+                info_lines.push(Line::from(vec![
+                    Span::styled("Session: ", Style::default().fg(theme.dimmed)),
+                    Span::styled(sid, Style::default().fg(theme.text)),
+                ]));
+            }
+        }
+
+        info_lines.extend([Line::from(vec![
+            Span::styled("Status:  ", Style::default().fg(theme.dimmed)),
+            {
+                // A dormant (idle-reaped, resumable) structured worker
+                // reads "Dormant" in dim amber, distinct from a deliberate
+                // Stop or a live Idle. See #2250.
+                let (label, color) = if instance.is_shown_dormant() {
+                    ("Dormant".to_string(), theme.dormant())
+                } else {
+                    (
+                        format!("{:?}", instance.status),
+                        match instance.status {
+                            crate::session::Status::Running => theme.running,
+                            crate::session::Status::Waiting => theme.waiting,
+                            crate::session::Status::Idle => {
+                                theme.idle_color_at_age(instance.idle_age(), idle_decay_window)
+                            }
+                            crate::session::Status::Unknown => theme.waiting,
+                            crate::session::Status::Stopped => theme.dimmed,
+                            crate::session::Status::Error => theme.error,
+                            crate::session::Status::Starting => theme.dimmed,
+                            crate::session::Status::Deleting => theme.waiting,
+                            crate::session::Status::Creating => theme.accent,
+                        },
+                    )
+                };
+                Span::styled(label, Style::default().fg(color))
+            },
+        ])]);
 
         // Add sandbox information if present
         if let Some(sandbox) = &instance.sandbox_info {
@@ -834,6 +866,69 @@ mod tests {
             let mut inst = Instance::new("sandboxed", "/tmp/sandboxed");
             inst.sandbox_info = Some(enabled_sandbox());
             assert_eq!(agent_info_height(&inst), 4);
+        }
+
+        #[test]
+        fn captured_session_id_adds_one_row() {
+            let mut inst = Instance::new("sid", "/tmp/sid");
+            assert_eq!(agent_info_height(&inst), 3, "none before capture");
+            inst.agent_session_id = Some("11111111-2222-3333-4444-555555555555".into());
+            assert_eq!(agent_info_height(&inst), 4);
+        }
+
+        #[test]
+        fn session_id_and_sandbox_stack() {
+            let mut inst = Instance::new("both", "/tmp/both");
+            inst.sandbox_info = Some(enabled_sandbox());
+            inst.agent_session_id = Some("abc".into());
+            assert_eq!(agent_info_height(&inst), 5);
+        }
+
+        /// The invariant the formula exists to serve: `render_info` must draw
+        /// exactly as many rows as `agent_info_height` reports. Asserting the
+        /// formula alone would still pass if the renderer drifted, and the
+        /// symptom of drift (output clipped one row per frame) is invisible in
+        /// a unit test that never renders.
+        #[test]
+        fn rendered_rows_match_reported_height() {
+            use ratatui::backend::TestBackend;
+            use ratatui::layout::Rect;
+            use ratatui::Terminal;
+            use std::time::Duration;
+
+            for sid in [None, Some("11111111-2222-3333-4444-555555555555")] {
+                let mut inst = Instance::new("render", "/tmp/render");
+                inst.agent_session_id = sid.map(str::to_string);
+                let expected = agent_info_height(&inst);
+
+                let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        super::super::Preview::render_info(
+                            frame,
+                            Rect::new(0, 0, 100, 12),
+                            &inst,
+                            &crate::tui::styles::Theme::default(),
+                            Duration::from_secs(600),
+                        );
+                    })
+                    .unwrap();
+
+                let buffer = terminal.backend().buffer().clone();
+                let drawn = (0..12u16)
+                    .filter(|y| {
+                        (0..100u16).any(|x| {
+                            let s = buffer[(x, *y)].symbol();
+                            !s.trim().is_empty()
+                        })
+                    })
+                    .count() as u16;
+
+                assert_eq!(
+                    drawn, expected,
+                    "session_id={sid:?}: rendered {drawn} rows but agent_info_height says {expected}"
+                );
+            }
         }
 
         #[test]
